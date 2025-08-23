@@ -1,11 +1,14 @@
+[phases.setup]
+# İsteğe bağlı ama netlik için: Go 1.22 kullan
+nixPkgs = ["go_1_22"]
+
 [phases.install]
-cmds = [
-  "go get github.com/xhit/go-simple-mail/v2@v2.16.0",
-  "go mod tidy"
-]
+# Sadece modülleri indir, tidy burada ÇALIŞMASIN
+cmds = ["go mod download"]
 
 [phases.build]
-cmds = ["go build -o out"]
+# En son copy’den sonra çalışacak: önce tidy, sonra build
+cmds = ["go mod tidy", "go build -o out"]
 
 [start]
 cmd = "./out"
