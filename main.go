@@ -2,91 +2,106 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	mail "github.com/xhit/go-simple-mail/v2"
 )
 
-type SendReq struct {
-	SMTPHost   string   `json:"smtp_host"`
-	SMTPPort   int      `json:"smtp_port"`
-	SMTPUser   string   `json:"smtp_user"`
-	SMTPPass   string   `json:"smtp_pass"`
-	Encryption string   `json:"encryption"` // STARTTLS | SSL | NONE
-	From       string   `json:"from"`
-	To         []string `json:"to"`
-	Cc         []string `json:"cc,omitempty"`
-	Bcc        []string `json:"bcc,omitempty"`
-	Subject    string   `json:"subject"`
-	Text       string   `json:"text,omitempty"`
-	HTML       string   `json:"html,omitempty"`
+type MailRequest struct {
+	SMTPHost  string   `json:"smtp_host"`
+	SMTPPort  int      `json:"smtp_port"`
+	SMTPUser  string   `json:"smtp_user"`
+	SMTPPass  string   `json:"smtp_pass"`
+	Encryption string  `json:"encryption"`
+	From      string   `json:"from"`
+	To        []string `json:"to"`
+	Subject   string   `json:"subject"`
+	Text      string   `json:"text"`
 }
 
 func sendHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var req SendReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+
+	var payload MailRequest
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
 		return
 	}
-	smtp := mail.NewSMTPClient()
-	smtp.Host = req.SMTPHost
-	smtp.Port = req.SMTPPort
-	smtp.Username = req.SMTPUser
-	smtp.Password = req.SMTPPass
-	smtp.ConnectTimeout = 15 * time.Second
-	smtp.SendTimeout = 30 * time.Second
-	switch req.Encryption {
-	case "STARTTLS":
-		smtp.Encryption = mail.EncryptionSTARTTLS
-	case "SSL":
-		smtp.Encryption = mail.EncryptionSSL
-	default:
-		smtp.Encryption = mail.EncryptionNone
-	}
-	client, err := smtp.Connect()
-	if err != nil {
-		http.Error(w, "SMTP connect failed: "+err.Error(), http.StatusBadGateway)
-		return
-	}
-	email := mail.NewMSG()
-	email.SetFrom(req.From)
-	for _, t := range req.To { email.AddTo(t) }
-	for _, c := range req.Cc { email.AddCc(c) }
-	for _, b := range req.Bcc { email.AddBcc(b) }
-	email.SetSubject(req.Subject)
-	if req.HTML != "" {
-		if req.Text != "" {
-			email.SetBody(mail.TextPlain, req.Text)
-			email.AddAlternative(mail.TextHTML, req.HTML)
-		} else {
-			email.SetBody(mail.TextHTML, req.HTML)
+
+	// Timeout ENV (default 10 saniye)
+	timeoutSec := 30
+	if v := os.Getenv("TIMEOUT_SECONDS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			timeoutSec = n
 		}
-	} else {
-		email.SetBody(mail.TextPlain, req.Text)
 	}
+
+	// SMTP client ayarları
+	client := mail.NewSMTPClient()
+	client.Host = payload.SMTPHost
+	client.Port = payload.SMTPPort
+	client.Username = payload.SMTPUser
+	client.Password = payload.SMTPPass
+	client.ConnectTimeout = time.Duration(timeoutSec) * time.Second
+	client.SendTimeout = time.Duration(timeoutSec) * time.Second
+	client.KeepAlive = false
+
+	switch payload.Encryption {
+	case "SSL":
+		client.Encryption = mail.EncryptionSSL
+	case "STARTTLS":
+		client.Encryption = mail.EncryptionSTARTTLS
+	default:
+		client.Encryption = mail.EncryptionNone
+	}
+
+	// SMTP server’a bağlan
+	smtpClient, err := client.Connect()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("SMTP connect failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Mail hazırla
+	email := mail.NewMSG()
+	email.SetFrom(payload.From).
+		AddTo(payload.To...).
+		SetSubject(payload.Subject)
+	email.SetBody(mail.TextPlain, payload.Text)
+
 	if email.Error != nil {
-		http.Error(w, "email build error: "+email.Error.Error(), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Mail build error: %v", email.Error), http.StatusBadRequest)
 		return
 	}
-	if err := email.Send(client); err != nil {
-		http.Error(w, "send failed: "+err.Error(), http.StatusBadGateway)
+
+	// Mail gönder
+	if err := email.Send(smtpClient); err != nil {
+		http.Error(w, fmt.Sprintf("Mail send error: %v", err), http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Mail sent successfully"))
 }
 
 func main() {
 	http.HandleFunc("/send", sendHandler)
-	port := os.Getenv("PORT")
-	if port == "" { port = "8080" }
-	log.Println("HTTP→SMTP listening on :" + port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+
+	port := "8080"
+	if p := os.Getenv("PORT"); p != "" {
+		port = p
+	}
+
+	log.Printf("Listening on :%s ...", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Server failed: %v", err)
+	}
 }
