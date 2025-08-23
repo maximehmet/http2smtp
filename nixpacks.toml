@@ -1,0 +1,11 @@
+[phases.install]
+cmds = [
+  "go get github.com/xhit/go-simple-mail/v2@v2.16.0",
+  "go mod tidy"
+]
+
+[phases.build]
+cmds = ["go build -o out"]
+
+[start]
+cmd = "./out"
