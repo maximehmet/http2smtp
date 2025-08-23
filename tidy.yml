@@ -1,0 +1,25 @@
+name: go mod tidy & push
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+jobs:
+  tidy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - run: go mod tidy
+      - name: Commit go.sum
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add go.sum
+            git commit -m "chore: add/update go.sum via CI"
+            git push
+          fi
