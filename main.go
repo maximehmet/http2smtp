@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -23,6 +24,7 @@ type SendReq struct {
 	Subject    string   `json:"subject"`
 	Text       string   `json:"text,omitempty"`
 	HTML       string   `json:"html,omitempty"`
+	HTMLBase64 string   `json:"html_base64,omitempty"`
 }
 
 func sendHandler(w http.ResponseWriter, r *http.Request) {
@@ -30,11 +32,13 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
+
 	var req SendReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+
 	smtp := mail.NewSMTPClient()
 	smtp.Host = req.SMTPHost
 	smtp.Port = req.SMTPPort
@@ -42,6 +46,7 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 	smtp.Password = req.SMTPPass
 	smtp.ConnectTimeout = 15 * time.Second
 	smtp.SendTimeout = 30 * time.Second
+
 	switch req.Encryption {
 	case "STARTTLS":
 		smtp.Encryption = mail.EncryptionSTARTTLS
@@ -50,18 +55,40 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 	default:
 		smtp.Encryption = mail.EncryptionNone
 	}
+
 	client, err := smtp.Connect()
 	if err != nil {
 		http.Error(w, "SMTP connect failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
+
 	email := mail.NewMSG()
 	email.SetFrom(req.From)
-	for _, t := range req.To { email.AddTo(t) }
-	for _, c := range req.Cc { email.AddCc(c) }
-	for _, b := range req.Bcc { email.AddBcc(b) }
+	for _, t := range req.To {
+		email.AddTo(t)
+	}
+	for _, c := range req.Cc {
+		email.AddCc(c)
+	}
+	for _, b := range req.Bcc {
+		email.AddBcc(b)
+	}
 	email.SetSubject(req.Subject)
-	if req.HTML != "" {
+
+	// HTML önceliği: base64 > raw > text
+	if req.HTMLBase64 != "" {
+		decoded, err := base64.StdEncoding.DecodeString(req.HTMLBase64)
+		if err != nil {
+			http.Error(w, "invalid base64 HTML: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.Text != "" {
+			email.SetBody(mail.TextPlain, req.Text)
+			email.AddAlternative(mail.TextHTML, string(decoded))
+		} else {
+			email.SetBody(mail.TextHTML, string(decoded))
+		}
+	} else if req.HTML != "" {
 		if req.Text != "" {
 			email.SetBody(mail.TextPlain, req.Text)
 			email.AddAlternative(mail.TextHTML, req.HTML)
@@ -71,14 +98,17 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		email.SetBody(mail.TextPlain, req.Text)
 	}
+
 	if email.Error != nil {
 		http.Error(w, "email build error: "+email.Error.Error(), http.StatusBadRequest)
 		return
 	}
+
 	if err := email.Send(client); err != nil {
 		http.Error(w, "send failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
@@ -86,7 +116,9 @@ func sendHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("/send", sendHandler)
 	port := os.Getenv("PORT")
-	if port == "" { port = "8080" }
+	if port == "" {
+		port = "8080"
+	}
 	log.Println("HTTP→SMTP listening on :" + port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
