@@ -2,106 +2,125 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
+	"errors"
 	"log"
-	"net/http"
 	"os"
-	"strconv"
+	"strings"
 	"time"
 
 	mail "github.com/xhit/go-simple-mail/v2"
 )
 
-type MailRequest struct {
-	SMTPHost  string   `json:"smtp_host"`
-	SMTPPort  int      `json:"smtp_port"`
-	SMTPUser  string   `json:"smtp_user"`
-	SMTPPass  string   `json:"smtp_pass"`
-	Encryption string  `json:"encryption"`
-	From      string   `json:"from"`
-	To        []string `json:"to"`
-	Subject   string   `json:"subject"`
-	Text      string   `json:"text"`
+type Payload struct {
+	SMTPHost   string   `json:"smtp_host"`
+	SMTPPort   int      `json:"smtp_port"`
+	SMTPUser   string   `json:"smtp_user"`
+	SMTPPass   string   `json:"smtp_pass"`
+	Encryption string   `json:"encryption"` // "STARTTLS" | "SSLTLS" | "NONE"
+	From       string   `json:"from"`
+	To         []string `json:"to"`
+	Subject    string   `json:"subject"`
+	HTML       string   `json:"html"`
+	Text       string   `json:"text,omitempty"` // opsiyonel fallback
 }
 
-func sendHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var payload MailRequest
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	// Timeout ENV (default 10 saniye)
-	timeoutSec := 30
-	if v := os.Getenv("TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			timeoutSec = n
-		}
-	}
-
-	// SMTP client ayarları
-	client := mail.NewSMTPClient()
-	client.Host = payload.SMTPHost
-	client.Port = payload.SMTPPort
-	client.Username = payload.SMTPUser
-	client.Password = payload.SMTPPass
-	client.ConnectTimeout = time.Duration(timeoutSec) * time.Second
-	client.SendTimeout = time.Duration(timeoutSec) * time.Second
-	client.KeepAlive = false
-
-	switch payload.Encryption {
-	case "SSL":
-		client.Encryption = mail.EncryptionSSL
+func encFromString(s string) mail.Encryption {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
 	case "STARTTLS":
-		client.Encryption = mail.EncryptionSTARTTLS
+		return mail.EncryptionSTARTTLS
+	case "SSLTLS", "SSL", "TLS":
+		return mail.EncryptionSSLTLS
+	case "NONE", "":
+		return mail.EncryptionNone
 	default:
-		client.Encryption = mail.EncryptionNone
+		return mail.EncryptionSTARTTLS
 	}
-
-	// SMTP server’a bağlan
-	smtpClient, err := client.Connect()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("SMTP connect failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Mail hazırla
-	email := mail.NewMSG()
-	email.SetFrom(payload.From).
-		AddTo(payload.To...).
-		SetSubject(payload.Subject)
-	email.SetBody(mail.TextPlain, payload.Text)
-
-	if email.Error != nil {
-		http.Error(w, fmt.Sprintf("Mail build error: %v", email.Error), http.StatusBadRequest)
-		return
-	}
-
-	// Mail gönder
-	if err := email.Send(smtpClient); err != nil {
-		http.Error(w, fmt.Sprintf("Mail send error: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Mail sent successfully"))
 }
 
 func main() {
-	http.HandleFunc("/send", sendHandler)
+	// 1) JSON oku (dosyadan veya stdin)
+	//   - dosyadan: go run main.go payload.json
+	//   - stdin:    cat payload.json | go run main.go
+	var data []byte
+	var err error
 
-	port := "8080"
-	if p := os.Getenv("PORT"); p != "" {
-		port = p
+	if len(os.Args) > 1 {
+		data, err = os.ReadFile(os.Args[1])
+	} else {
+		data, err = os.ReadFile("payload.json")
+		// stdin istersen:
+		// data, err = io.ReadAll(os.Stdin)
+	}
+	if err != nil {
+		log.Fatal("JSON okunamadı:", err)
 	}
 
-	log.Printf("Listening on :%s ...", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("Server failed: %v", err)
+	var p Payload
+	if err := json.Unmarshal(data, &p); err != nil {
+		log.Fatal("JSON parse hatası:", err)
 	}
+
+	// 2) Basit validasyon
+	if p.SMTPHost == "" || p.SMTPPort == 0 || p.SMTPUser == "" || p.SMTPPass == "" {
+		log.Fatal(errors.New("smtp_host, smtp_port, smtp_user, smtp_pass zorunlu"))
+	}
+	if len(p.To) == 0 {
+		log.Fatal(errors.New("en az bir 'to' alıcısı gerekli"))
+	}
+	if p.From == "" {
+		p.From = p.SMTPUser // çoğu SMTP'de kimliklenen adresi kullanmak daha sorunsuz
+	}
+
+	// Gmail App Password boşluksuz girilmeli (Gmail arayüzü boşluklu gösterir)
+	p.SMTPPass = strings.ReplaceAll(p.SMTPPass, " ", "")
+
+	// 3) SMTP client hazırla
+	client := mail.NewSMTPClient()
+	client.Host = p.SMTPHost
+	client.Port = p.SMTPPort
+	client.Username = p.SMTPUser
+	client.Password = p.SMTPPass
+	client.Encryption = encFromString(p.Encryption)
+	client.Authentication = mail.AuthAuto
+	client.ConnectTimeout = 20 * time.Second
+	client.SendTimeout = 30 * time.Second
+	client.KeepAlive = false
+
+	smtpClient, err := client.Connect()
+	if err != nil {
+		log.Fatalf("SMTP bağlantı hatası: %v", err)
+	}
+
+	// 4) Mesajı hazırla
+	msg := mail.NewMSG().
+		SetFrom(p.From).
+		SetSubject(p.Subject)
+
+	for _, to := range p.To {
+		msg.AddTo(strings.TrimSpace(to))
+	}
+
+	// HTML + (opsiyonel) text fallback
+	if p.HTML != "" {
+		msg.SetBody(mail.TextHTML, p.HTML)
+		if p.Text != "" {
+			msg.AddAlternative(mail.TextPlain, p.Text)
+		}
+	} else if p.Text != "" {
+		// HTML yoksa düz metin gönder
+		msg.SetBody(mail.TextPlain, p.Text)
+	} else {
+		log.Fatal("Ne 'html' ne de 'text' verilmiş; gövde boş olamaz")
+	}
+
+	if msg.Error != nil {
+		log.Fatal("Mesaj oluşturma hatası:", msg.Error)
+	}
+
+	// 5) Gönder
+	if err := msg.Send(smtpClient); err != nil {
+		log.Fatalf("Gönderim hatası: %v", err)
+	}
+
+	log.Println("E-posta başarıyla gönderildi ✔")
 }
